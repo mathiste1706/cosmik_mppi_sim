@@ -61,6 +61,20 @@ class BaseTask():
         self.control_process.update_params(**kwargs)
         return True
 
+    @property
+    def multimodal(self):
+        """Latest multimodal MPPI decision (active family, per-family scores), if enabled."""
+        return getattr(self.control_process, "multimodal", {})
+
+    @property
+    def exec_costs(self):
+        """Per-term costs of the executed (mean) plan and of the highest-weight particle."""
+        return getattr(self.control_process, "exec_costs", {})
+
+    def set_dynamic_world_forecast(self, times, spheres):
+        """See ControlProcess.set_dynamic_world_forecast."""
+        self.control_process.set_dynamic_world_forecast(times, spheres)
+
     def reset(self) -> None:
         """Full reset for a fresh rollout, instead of hotstart silently warm-starting from
         whatever plan/belief existed before. Two parts:

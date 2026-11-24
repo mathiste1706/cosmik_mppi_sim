@@ -35,7 +35,7 @@ model:
   dt_traj_params:
     base_dt: 0.02
     base_ratio: 0.5
-    max_dt: 0.02
+    max_dt: 0.1  # was 0.02: 25 x 0.02 s + 25 steps ramping to 0.1 s = 2 s lookahead (retest after bound_thresh fix)
   ee_link_name: ee_link
   init_state:
   - 0.8
@@ -103,9 +103,9 @@ cost:
     - 1.0
     - 1.0
     - 1.0
-    weight:
+    weight:  # [orientation, position]
     - 1.0
-    - 10.0
+    - 50.0  # was 10.0: position and orientation pulled equally, robot settled ~10 cm from the target
     position_gaussian_params:
       n: 0
       c: 0.0
@@ -166,6 +166,7 @@ cost:
       r: 10.0
   table_collision:
     weight: 1000.0
+    ignore_links: [panda_link0, panda_link1]
     distance_threshold: -0.01
     violation_clip_max: 0.2
     violation_scale: 1.0
@@ -174,6 +175,18 @@ cost:
       c: 0.0
       s: 0
       r: 10.0
+  # Point 3: anticipatory cost on the clearance h to the human arm only (streamed forecast
+  # spheres; table/boxes excluded). Adds to primitive_collision (5 cm) and the CaT 10 cm margin,
+  # replaces neither. See storm_kit/mpc/cost/human_proximity_cost.py.
+  # Off while both weights are 0. Values to test: weight 20.0 (= goal cost per step when h
+  # reaches the margin), cbf_weight 1000.0 (1 cm closed too fast in one step costs 10).
+  human_proximity:
+    weight: 0.0
+    influence_distance: 0.25  # m; h above this costs nothing
+    margin: 0.10  # m; same as cat_primitive_collision.distance_threshold (not reduced)
+    clip: 1.0  # proximity term saturates at weight once h <= margin
+    cbf_weight: 0.0
+    cbf_gamma: 0.2  # b_{k+1} >= 0.8 * b_k, b = h - margin, inside influence_distance
   robot_self_collision:
     weight: 0.0
     distance_threshold: 0.01
@@ -185,7 +198,7 @@ cost:
     explicit_geometry: true
     srdf_path: robot/fer_real/fer.srdf
   null_space:
-    weight: 0.1
+    weight: 0.3  # was 0.1: fewer contorted postures, 1/18 runs with arm contact instead of 5/18; 1.0 tested: no contact but rarely reaches B
     gaussian_params:
       n: 0
       c: 0.0
@@ -272,7 +285,7 @@ cost:
       c: 0.0
       s: 0
       r: 10.0
-    bound_thresh: 0.25
+    bound_thresh: 0.05  # was 0.25 (middle half only); 0.02 too close to the limits for the real robot (0.06 similar, more contact at 0.5 Hz)
   retract_state:
   - 0.0
   - 0.0
@@ -294,16 +307,16 @@ cost:
     limit_scale: 0.8
     backend: fused
 mppi:
-  horizon: 50
-  init_cov: 1.0  #0.05
-  gamma: 0.98
+  horizon: 50  # 50 x 0.02 s = 1 s (100 made state_bound swamp goal_pose)
+  init_cov: 0.3  # was 0.05 (anti-shake): too little exploration, all rollouts identical (N_eff ~975/1000)
+  gamma: 1.0  # was 0.98: 0.98^50 = 0.36, the end of the plan (the payoff of a detour) counted 3x less
   n_iters: 1
-  step_size_mean: 0.9
+  step_size_mean: 0.5  # was 0.9: smoother mean updates, damps the shaking from init_cov 0.3
   step_size_cov: 0.8
-  beta: 5.0
+  beta: 75.0  # was 5.0: scaled with the 5x goal position weight, N_eff had collapsed to 1
   alpha: 1
-  num_particles: 1000
-  update_cov: false
+  num_particles: 1000  # was 1000, then 2000 (more rollouts to find the detour over the arm); back to 1000 to speed up MPPI
+  update_cov: false  # true tested: deeper human contacts (-21 cm)
   cov_type: full_AxA
   kappa: 0.05
   null_act_frac: 0.01
@@ -317,19 +330,19 @@ mppi:
     fixed_samples: true
     sample_ratio: {'halton':0.0, 'halton-knot':1.0, 'random':0.0, 'random-knot':0.0}
     seed: 0
-    knot_scale: 4
+    knot_scale: 10  # was 4: 5 knots over the horizon instead of 12, smoother and larger coherent deviations
     antithetic: true
   cat_primitive_collision:
     enabled: true
     # Preserve a reward signal when every rollout initially violates a margin.
     # p_max=1 collapsed to uniform updates on the moving COSMIK bag start;
     # 0.15 completed both reaches with human/self and joint limits respected.
-    p_max: 0.15
+    p_max: 0.15  # was 0.15: with the 10 cm margin nearly every rollout violated and weights went uniform; 0.1 tested: robot froze near A/B, still hit
     tau_c: 0.95
     tau_b: 0.95
     eps: 1.0e-06
     distance_threshold: 0.1
-    violation_clip_max: 0.2
+    violation_clip_max: 0.1  # was 0.2
     violation_scale: 0.25
   cat_state_bound:
     enabled: true
@@ -343,6 +356,10 @@ mppi:
     p_max: 0.15
     tau_c: 0.95
   cat_self_collision:
+    enabled: true
+    p_max: 0.15
+    tau_c: 0.95
+  cat_table_collision:
     enabled: true
     p_max: 0.15
     tau_c: 0.95

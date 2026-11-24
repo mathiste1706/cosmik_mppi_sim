@@ -27,7 +27,8 @@ from .gaussian_projection import GaussianProjection
 
 class BoundCost(nn.Module):
     def __init__(self, tensor_args={'device':torch.device('cpu'), 'dtype':torch.float64},
-                 bounds=[], weight=1.0, gaussian_params={}, bound_thresh=0.1):
+                 bounds=[], weight=1.0, gaussian_params={}, bound_thresh=0.1, bound_thresh_override=None):
+        # was: bounds=[], weight=1.0, gaussian_params={}, bound_thresh=0.1):
         super(BoundCost, self).__init__()
         self.tensor_args = tensor_args
         self.weight = torch.as_tensor(weight, **tensor_args)
@@ -38,7 +39,13 @@ class BoundCost(nn.Module):
         self.bnd_range = (self.raw_bounds[:,1] - self.raw_bounds[:,0]) / 2.0
         self.t_mat = None
         self.bound_thresh = float(bound_thresh)
-        bound_thresh_abs = self.bound_thresh * self.bnd_range
+        # bound_thresh_abs = self.bound_thresh * self.bnd_range
+        # Optional per-dimension margin {state index: fraction of the half range}, e.g. {1: 0.15}
+        # keeps q2 further from its limit; every other dimension keeps bound_thresh.
+        thresh = torch.full_like(self.bnd_range, self.bound_thresh)
+        for idx, val in (bound_thresh_override or {}).items():
+            thresh[int(idx)] = float(val)
+        bound_thresh_abs = thresh * self.bnd_range
         self.bounds[:,1] = self.raw_bounds[:,1] - bound_thresh_abs
         self.bounds[:,0] = self.raw_bounds[:,0] + bound_thresh_abs
 

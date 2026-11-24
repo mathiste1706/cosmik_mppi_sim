@@ -46,10 +46,12 @@ class ReacherTask(ArmTask):
         world_file="collision_env.yml",
         tensor_args={"device": "cpu", "dtype": torch.float32},
         world_params=None,
+        mppi_overrides=None,
     ):
         
         super().__init__(task_file=task_file, robot_file=robot_file,
-                         world_file=world_file, tensor_args=tensor_args, world_params=world_params)
+                         world_file=world_file, tensor_args=tensor_args, world_params=world_params,
+                         mppi_overrides=mppi_overrides)
 
     def get_rollout_fn(self, **kwargs):
         if kwargs['exp_params'].get('common_ocp'):

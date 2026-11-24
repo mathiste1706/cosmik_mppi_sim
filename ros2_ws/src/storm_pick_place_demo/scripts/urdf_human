@@ -1,0 +1,580 @@
+#!/usr/bin/env python3
+"""RT-COSMIK URDF human, published in the same MarkerArray format as live COSMIK.
+
+The RT-COSMIK URDF (urdf/human/human.urdf) is displayed through a separate
+robot_state_publisher under the ``human/`` TF prefix. This node:
+
+* places ``human/world`` in ``world`` (static TF),
+* publishes the posture on ``/human/joint_states`` (fixed, or one joint moving
+  as a sinusoid of ROS time),
+* publishes one CYLINDER per collision segment (``collision_segments``, the right
+  arm by default) on the collision topic,
+* publishes the forecast of those cylinders on the forecast topic: the same
+  markers evaluated at future times, each marker stamped with its predicted time.
+
+Segment poses come from this node's own forward kinematics of the URDF, so the
+forecast and the current geometry use the same model as the RViz display.
+
+The URDF has no <collision> elements; segment radii/lengths below are a
+conservative hand-made approximation of its meshes. In the URDF, each limb
+points along its link's local -Y axis, and the body faces local +X.
+"""
+import math
+import random
+from collections import deque
+import xml.etree.ElementTree as ET
+
+import numpy as np
+import rclpy
+from builtin_interfaces.msg import Time as TimeMsg
+from geometry_msgs.msg import TransformStamped
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+from tf2_ros import StaticTransformBroadcaster
+from visualization_msgs.msg import Marker, MarkerArray
+
+# Arm reaching forward into the robot's A <-> B path.
+# Positive shoulder/elbow Z flexes forward for this model (URDF limits are not
+# enforced by robot_state_publisher; they are inconsistent with this convention).
+DEFAULT_POSTURE = {
+    'right_shoulder_Z': 1.2,
+    'right_elbow_Z': 0.3,
+    'left_shoulder_Z': 0.1,
+    'left_elbow_Z': 0.2,
+}
+
+# (name, link, centre offset along link +Y [m], length [m], radius [m])
+# The order is the slot order seen by the planner: keep it identical in every message.
+SEGMENTS = [
+    ('torso', 'torso', 0.25, 0.55, 0.14),
+    ('head', 'torso', 0.58, 0.25, 0.10),
+    ('upperarm_R', 'upperarmR', -0.137, 0.30, 0.06),
+    ('lowerarm_R', 'lowerarmR', -0.15, 0.30, 0.05),
+    ('upperarm_L', 'upperarmL', -0.137, 0.30, 0.06),
+    ('lowerarm_L', 'lowerarmL', -0.15, 0.30, 0.05),
+    ('thigh_R', 'thighR', -0.21, 0.45, 0.08),
+    ('shank_R', 'shankR', -0.21, 0.45, 0.06),
+    ('thigh_L', 'thighL', -0.21, 0.45, 0.08),
+    ('shank_L', 'shankL', -0.21, 0.45, 0.06),
+]
+
+
+def rpy_matrix(r, p, y):
+    cr, sr, cp, sp, cy, sy = math.cos(r), math.sin(r), math.cos(p), math.sin(p), math.cos(y), math.sin(y)
+    return np.array([
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp, cp * sr, cp * cr],
+    ])
+
+
+def axis_angle_matrix(axis, angle):
+    x, y, z = axis
+    c, s = math.cos(angle), math.sin(angle)
+    C = 1.0 - c
+    return np.array([
+        [c + x * x * C, x * y * C - z * s, x * z * C + y * s],
+        [y * x * C + z * s, c + y * y * C, y * z * C - x * s],
+        [z * x * C - y * s, z * y * C + x * s, c + z * z * C],
+    ])
+
+
+def matrix_to_quat(R):
+    """Rotation matrix -> (x, y, z, w)."""
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    if trace > 0.0:
+        s = 2.0 * math.sqrt(trace + 1.0)
+        return ((R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s, 0.25 * s)
+    i = int(np.argmax([R[0, 0], R[1, 1], R[2, 2]]))
+    j, k = (i + 1) % 3, (i + 2) % 3
+    s = 2.0 * math.sqrt(1.0 + R[i, i] - R[j, j] - R[k, k])
+    q = [0.0, 0.0, 0.0, (R[k, j] - R[j, k]) / s]
+    q[i] = 0.25 * s
+    q[j] = (R[j, i] + R[i, j]) / s
+    q[k] = (R[k, i] + R[i, k]) / s
+    return tuple(q)
+
+
+class UrdfKinematics:
+    """Forward kinematics of a URDF tree (fixed and revolute joints)."""
+
+    def __init__(self, urdf_path):
+        root = ET.parse(urdf_path).getroot()
+        self.joints = []
+        children = set()
+        for j in root.iter('joint'):
+            origin = j.find('origin')
+            xyz = [float(v) for v in origin.get('xyz', '0 0 0').split()] if origin is not None else [0.0] * 3
+            rpy = [float(v) for v in origin.get('rpy', '0 0 0').split()] if origin is not None else [0.0] * 3
+            axis_el = j.find('axis')
+            axis = np.array([float(v) for v in axis_el.get('xyz').split()]) if axis_el is not None else np.array([1.0, 0, 0])
+            T = np.eye(4)
+            T[:3, :3] = rpy_matrix(*rpy)
+            T[:3, 3] = xyz
+            child = j.find('child').get('link')
+            children.add(child)
+            self.joints.append(dict(name=j.get('name'), type=j.get('type'), parent=j.find('parent').get('link'),
+                                    child=child, origin=T, axis=axis / np.linalg.norm(axis)))
+        if any(j['type'] not in ('fixed', 'revolute', 'continuous') for j in self.joints):
+            raise ValueError('Only fixed/revolute/continuous joints are supported.')
+        roots = {j['parent'] for j in self.joints} - children
+        if len(roots) != 1:
+            raise ValueError(f'Expected one URDF root link, got {sorted(roots)}')
+        self.root = roots.pop()
+        self.movable = [j['name'] for j in self.joints if j['type'] != 'fixed']
+
+    def descendant_links(self, joint_name):
+        """Links moved by joint_name (its child link and everything below it)."""
+        links = {next(j['child'] for j in self.joints if j['name'] == joint_name)}
+        grew = True
+        while grew:
+            below = {j['child'] for j in self.joints if j['parent'] in links}
+            grew = not below <= links
+            links |= below
+        return links
+
+    def link_poses(self, q):
+        """4x4 pose of every link in the URDF root frame, for joint positions q (dict)."""
+        poses = {self.root: np.eye(4)}
+        pending = list(self.joints)
+        while pending:
+            remaining = []
+            for j in pending:
+                if j['parent'] not in poses:
+                    remaining.append(j)
+                    continue
+                T = poses[j['parent']] @ j['origin']
+                if j['type'] != 'fixed':
+                    M = np.eye(4)
+                    M[:3, :3] = axis_angle_matrix(j['axis'], q.get(j['name'], 0.0))
+                    T = T @ M
+                poses[j['child']] = T
+            if len(remaining) == len(pending):
+                raise ValueError('URDF joint tree is disconnected.')
+            pending = remaining
+        return poses
+
+
+# Rotation of +90 deg about X: maps the marker's cylinder axis (local Z) onto link -Y.
+Z_TO_LINK_Y = axis_angle_matrix((1.0, 0.0, 0.0), math.pi / 2.0)
+
+
+class UrdfHuman(Node):
+    def __init__(self):
+        super().__init__('urdf_human')
+        self.declare_parameter('topic', '/rtcosmik/collision_markers')
+        self.declare_parameter('forecast_topic', '/rtcosmik/collision_forecast')
+        self.declare_parameter('frame_id', 'world')
+        self.declare_parameter('prefix', 'human/')
+        # Pose of human/world (= pelvis, before the URDF's +90 deg X rotation) in frame_id.
+        # z=0.25 assumes the robot base sits on a ~0.75 m table with the human standing on the floor.
+        self.declare_parameter('xyz', [-1.0, 0.70, 0.15])
+        self.declare_parameter('yaw', 0.0)  # 0: human faces +X, i.e. towards the robot base.
+        self.declare_parameter('urdf_path', '')
+        self.declare_parameter('joint_names', list(DEFAULT_POSTURE.keys()))
+        self.declare_parameter('joint_positions', list(DEFAULT_POSTURE.values()))
+        # motion=sine: q[sine_joint](t) = posture + amplitude * sin(2*pi*t/period), t = ROS time.
+        self.declare_parameter('motion', 'static')
+        self.declare_parameter('sine_joint', 'right_shoulder_Z')
+        self.declare_parameter('sine_amplitude', 0.3)  # rad; was 0.6. 0.15 tested: no contacts but B blocked (B only reachable with the hand near its top)
+        self.declare_parameter('sine_period', 4.0)  # s
+        # Random alternation: [small, large] amplitudes [rad]; empty keeps sine_amplitude. One
+        # amplitude per period, drawn 50/50 from sine_switch_seed and the period index; switches
+        # happen when the arm is at the posture (sin = 0), so the position stays continuous.
+        self.declare_parameter('sine_amplitudes', [0.0])  # [0.0] = off (rclpy needs a typed default)
+        self.declare_parameter('sine_switch_seed', 0)
+        # False: the forecast keeps the amplitude of the current period over its whole horizon
+        # (it cannot know a future switch). True: the forecast follows the true future motion.
+        self.declare_parameter('forecast_knows_switch', False)
+        # Segments sent to the planner as collision geometry (current and forecast); empty: all.
+        # Only the moving right arm by default: the rest of the body is not an obstacle to avoid.
+        self.declare_parameter('collision_segments', ['upperarm_R', 'lowerarm_R'])
+        # Forecast samples at now + k * forecast_dt, k = 0..round(forecast_horizon / forecast_dt).
+        # s; was 3.0 (latency + the whole 2 s MPPI horizon). Beyond it the planner holds the last
+        # sample: a 2 s forecast made MPPI wait beside a slow arm until the arm came down on it.
+        self.declare_parameter('forecast_horizon', 1.0)
+        self.declare_parameter('forecast_dt', 0.04)  # s; the planner interpolates between samples.
+        # Adaptive horizon: forecast_horizon for a slow arm, up to forecast_horizon_max for a fast
+        # one, linear in the observed mean speed of the fastest segment centre over
+        # forecast_speed_window. Sweep: 1 s best at <= 0.2 Hz, 2 s best at 0.5 Hz; the forearm
+        # centre averages ~0.05 m/s per 0.1 Hz. forecast_horizon_max <= forecast_horizon: fixed.
+        self.declare_parameter('forecast_horizon_max', 2.0)
+        self.declare_parameter('forecast_speed_low', 0.085)  # m/s; was 0.10. 0.1 Hz arm reads 0.077 -> forecast_horizon
+        self.declare_parameter('forecast_speed_high', 0.14)  # m/s; was 0.20. 0.2 Hz arm reads 0.12-0.15 -> ~1.6-2 s
+        self.declare_parameter('forecast_speed_window', 2.0)  # s
+        # Periodic blocking of B by the LEFT hand (its shoulder is in line with B): a forward-backward
+        # reach, hand kept at ~0.35 m, between a retracted posture (hand ~24 cm short of B for x = -1.0)
+        # and an extended one (hand over B). Each block_period: block_move s out, block_dwell s over B,
+        # block_move s back, rest retracted. Deterministic: the forecast knows it. Off by default.
+        self.declare_parameter('block_enabled', True)
+        self.declare_parameter('block_joints', ['right_shoulder_Z', 'right_elbow_Z'])
+        self.declare_parameter('block_retracted', [0.0, 1.725])  # rad, hand at x = human x + 0.30 m, z 0.35
+        self.declare_parameter('block_extended', [0.80, 0.65])   # rad, hand at x = human x + 0.54 m, z 0.35
+        self.declare_parameter('block_period', 7.000)  # s
+        self.declare_parameter('block_dwell', 0.0)    # s over B
+        self.declare_parameter('block_move', 1.000)     # s for each reach / retract
+        self.declare_parameter('block_offset', 3.0)   # s: first reach starts at t = block_offset (mod period)
+        self.declare_parameter('block_segments', ['upperarm_R'])  # added to the collision geometry
+        # Random fast movements: short bumps q += a * sin^2(pi (t - t0) / jerk_duration) on jerk_joint,
+        # starting at Poisson times (mean jerk_mean_interval), a uniform in +-[0.5, 1] * jerk_amplitude.
+        # Seeded (jerk_seed). The forecast does not know them: it keeps the bump offset observed now
+        # over the whole horizon (forecast_knows_jerks True: it follows the true bumps). Off by default.
+        self.declare_parameter('jerk_enabled', True)
+        self.declare_parameter('jerk_joint', 'right_shoulder_Z')
+        self.declare_parameter('jerk_amplitude', 0.35)      # rad
+        self.declare_parameter('jerk_duration', 0.5)        # s (peak speed ~ pi * a / duration)
+        self.declare_parameter('jerk_mean_interval', 6.0)   # s
+        self.declare_parameter('jerk_seed', 105)
+        self.declare_parameter('forecast_knows_jerks', False)
+
+        self.frame_id = self.get_parameter('frame_id').value
+        self.prefix = self.get_parameter('prefix').value
+        self.kinematics = UrdfKinematics(self.get_parameter('urdf_path').value)
+
+        names = list(self.get_parameter('joint_names').value)
+        positions = [float(v) for v in self.get_parameter('joint_positions').value]
+        if len(names) != len(positions):
+            raise ValueError('joint_names and joint_positions must have the same length')
+        unknown = set(names) - set(self.kinematics.movable)
+        if unknown:
+            raise ValueError(f'Unknown human joints in posture: {sorted(unknown)}')
+        # robot_state_publisher only publishes TF for joints present in joint_states,
+        # so every movable joint is sent (0 rad unless overridden by the posture).
+        self.posture = {name: 0.0 for name in self.kinematics.movable}
+        self.posture.update(zip(names, positions))
+
+        self.motion = self.get_parameter('motion').value
+        if self.motion not in ('static', 'sine'):
+            raise ValueError("motion must be 'static' or 'sine'")
+        self.sine_joint = self.get_parameter('sine_joint').value
+        if self.sine_joint not in self.posture:
+            raise ValueError(f'Unknown sine_joint {self.sine_joint!r}')
+        self.sine_amplitude = float(self.get_parameter('sine_amplitude').value)
+        self.sine_period = float(self.get_parameter('sine_period').value)
+        if self.sine_period <= 0.0:
+            raise ValueError('sine_period must be > 0')
+        amps = [float(v) for v in self.get_parameter('sine_amplitudes').value]
+        self.sine_amplitudes = amps if len(amps) == 2 else None
+        self.sine_switch_seed = int(self.get_parameter('sine_switch_seed').value)
+        self.forecast_knows_switch = bool(self.get_parameter('forecast_knows_switch').value)
+        wanted = list(self.get_parameter('collision_segments').value)
+        unknown = set(wanted) - {name for name, *_ in SEGMENTS}
+        if unknown:
+            raise ValueError(f'Unknown collision_segments: {sorted(unknown)}')
+        # self.segments = [s for s in SEGMENTS if not wanted or s[0] in wanted]
+        self.block_enabled = bool(self.get_parameter('block_enabled').value)
+        self.block_joints = list(self.get_parameter('block_joints').value)
+        self.block_retracted = [float(v) for v in self.get_parameter('block_retracted').value]
+        self.block_extended = [float(v) for v in self.get_parameter('block_extended').value]
+        if self.block_enabled:
+            if not (len(self.block_joints) == len(self.block_retracted) == len(self.block_extended)):
+                raise ValueError('block_joints, block_retracted and block_extended must have the same length')
+            if set(self.block_joints) - set(self.posture):
+                raise ValueError(f'Unknown block_joints: {sorted(set(self.block_joints) - set(self.posture))}')
+            if wanted:
+                wanted += [s for s in self.get_parameter('block_segments').value if s not in wanted]
+        self.block_period = float(self.get_parameter('block_period').value)
+        self.block_dwell = float(self.get_parameter('block_dwell').value)
+        self.block_move = float(self.get_parameter('block_move').value)
+        self.block_offset = float(self.get_parameter('block_offset').value)
+        if self.block_enabled and (self.block_move <= 0.0 or 2.0 * self.block_move + self.block_dwell > self.block_period):
+            raise ValueError('need block_move > 0 and 2 * block_move + block_dwell <= block_period')
+        # Reactive blocking: instead of a fixed period, one reach (block_move out, block_dwell over B,
+        # block_move back) starts when the robot end effector approaches block_trigger_point, i.e. its
+        # distance decreases and lies in [block_trigger_near, block_trigger_far]; not again before
+        # block_refractory s after the retract. The robot gets no command: MPPI only sees the arm.
+        self.declare_parameter('block_mode', 'reactive')  # 'periodic' or 'reactive'
+        self.declare_parameter('block_trigger_point', [-0.5, 0.5, 0.3])  # B, in frame_id
+        self.declare_parameter('block_trigger_far', 0.400)   # m
+        self.declare_parameter('block_trigger_near', 0.20)  # m: closer, the reach would hit the robot
+        self.declare_parameter('block_refractory', 3.0)     # s
+        self.declare_parameter('block_robot_frame', 'fer_hand_tcp')
+        self.block_mode = self.get_parameter('block_mode').value
+        if self.block_mode not in ('periodic', 'reactive'):
+            raise ValueError("block_mode must be 'periodic' or 'reactive'")
+        self.block_trigger_point = np.array([float(v) for v in self.get_parameter('block_trigger_point').value])
+        self.block_trigger_far = float(self.get_parameter('block_trigger_far').value)
+        self.block_trigger_near = float(self.get_parameter('block_trigger_near').value)
+        self.block_refractory = float(self.get_parameter('block_refractory').value)
+        self.block_robot_frame = self.get_parameter('block_robot_frame').value
+        self.block_t0 = None          # start of the current / last reactive reach [s]
+        self.block_prev_dist = None   # previous end effector distance to the trigger point [m]
+        self.tf_buffer = None
+        if self.block_enabled and self.block_mode == 'reactive':
+            from tf2_ros import Buffer, TransformListener
+            self.tf_buffer = Buffer()
+            self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.jerk_enabled = bool(self.get_parameter('jerk_enabled').value)
+        self.jerk_joint = self.get_parameter('jerk_joint').value
+        if self.jerk_enabled and self.jerk_joint not in self.posture:
+            raise ValueError(f'Unknown jerk_joint {self.jerk_joint!r}')
+        self.jerk_amplitude = float(self.get_parameter('jerk_amplitude').value)
+        self.jerk_duration = float(self.get_parameter('jerk_duration').value)
+        self.forecast_knows_jerks = bool(self.get_parameter('forecast_knows_jerks').value)
+        self.jerks = []  # (start time [s], signed amplitude [rad]), sorted, for t in [0, 4000] s
+        if self.jerk_enabled:
+            rng = random.Random(int(self.get_parameter('jerk_seed').value) * 7_919 + 17)
+            mean, t_j = float(self.get_parameter('jerk_mean_interval').value), 0.0
+            while True:
+                t_j += self.jerk_duration + rng.expovariate(1.0 / mean)  # bumps never overlap
+                if t_j > 4000.0:
+                    break
+                self.jerks.append((t_j, rng.choice((-1.0, 1.0)) * rng.uniform(0.5, 1.0) * self.jerk_amplitude))
+            self.jerk_starts = [s for s, _ in self.jerks]
+        self.segments = [s for s in SEGMENTS if not wanted or s[0] in wanted]
+        self.forecast_dt = float(self.get_parameter('forecast_dt').value)
+        self.forecast_horizon = float(self.get_parameter('forecast_horizon').value)
+        if self.forecast_dt <= 0.0 or self.forecast_horizon < 0.0:
+            raise ValueError('forecast_dt must be > 0 and forecast_horizon >= 0')
+        self.forecast_horizon_max = max(self.forecast_horizon, float(self.get_parameter('forecast_horizon_max').value))
+        self.forecast_speed_low = float(self.get_parameter('forecast_speed_low').value)
+        self.forecast_speed_high = float(self.get_parameter('forecast_speed_high').value)
+        if self.forecast_speed_high <= self.forecast_speed_low:
+            raise ValueError('forecast_speed_high must be > forecast_speed_low')
+        self.forecast_speed_window = float(self.get_parameter('forecast_speed_window').value)
+        self.centre_history = deque()  # (t, [n_segments, 3] observed segment centres)
+        self.current_horizon = None
+        # Display only (the planner ignores colour): show the forecast of the moving segments,
+        # one sample in forecast_display_every; the others are sent fully transparent.
+        self.declare_parameter('forecast_display_every', 5)
+        self.forecast_display_every = max(1, int(self.get_parameter('forecast_display_every').value))
+        moved = self.kinematics.descendant_links(self.sine_joint) if self.motion == 'sine' else set()
+        for joint in (self.block_joints if self.block_enabled else []) + ([self.jerk_joint] if self.jerk_enabled else []):
+            moved |= self.kinematics.descendant_links(joint)
+        self.moving_segments = {name for name, link, *_ in self.segments if link in moved}
+
+        x, y, z = (float(v) for v in self.get_parameter('xyz').value)
+        yaw = float(self.get_parameter('yaw').value)
+        self.T_place = np.eye(4)
+        self.T_place[:3, :3] = axis_angle_matrix((0.0, 0.0, 1.0), yaw)
+        self.T_place[:3, 3] = (x, y, z)
+
+        self.marker_pub = self.create_publisher(MarkerArray, self.get_parameter('topic').value, 1)
+        forecast_topic = self.get_parameter('forecast_topic').value
+        self.forecast_pub = self.create_publisher(MarkerArray, forecast_topic, 1) if forecast_topic else None
+        self.joint_pub = self.create_publisher(JointState, '/human/joint_states', 10)
+        self.static_tf = StaticTransformBroadcaster(self)
+        self._publish_placement(x, y, z, yaw)
+        self.create_timer(1.0 / 30.0, self._publish)
+
+    # def joint_positions(self, t):
+    #     q = dict(self.posture)
+    #     if self.motion == 'sine':
+    #         q[self.sine_joint] += self.sine_amplitude * math.sin(2.0 * math.pi * t / self.sine_period)
+    #     return q
+    def amplitude_at(self, t):
+        """Amplitude of the period containing t (sine_amplitude unless the random alternation is on)."""
+        if self.sine_amplitudes is None:
+            return self.sine_amplitude
+        k = math.floor(t / self.sine_period)
+        return self.sine_amplitudes[random.Random(self.sine_switch_seed * 1_000_003 + k).random() < 0.5]
+
+    # def joint_positions(self, t, amp_time=None):
+    #     """Joint positions at t; amp_time: take the amplitude of the period containing amp_time (forecast)."""
+    #     q = dict(self.posture)
+    #     if self.motion == 'sine':
+    #         amp = self.amplitude_at(t if amp_time is None else amp_time)
+    #         q[self.sine_joint] += amp * math.sin(2.0 * math.pi * t / self.sine_period)
+    #     return q
+    def block_fraction(self, t):
+        """0 = left hand retracted, 1 = over B (smooth cosine ramps)."""
+        if not self.block_enabled:
+            return 0.0
+        # s = (t - self.block_offset) % self.block_period
+        if self.block_mode == 'reactive':
+            if self.block_t0 is None or t < self.block_t0:
+                return 0.0
+            s = t - self.block_t0  # one reach; 0 again after 2 * block_move + block_dwell
+        else:
+            s = (t - self.block_offset) % self.block_period
+        m, d = self.block_move, self.block_dwell
+        if s < m:
+            return 0.5 - 0.5 * math.cos(math.pi * s / m)
+        if s < m + d:
+            return 1.0
+        if s < 2.0 * m + d:
+            return 0.5 + 0.5 * math.cos(math.pi * (s - m - d) / m)
+        return 0.0
+
+    def jerk_offset(self, t):
+        """Offset of the random fast movement on jerk_joint at t (0 between bumps)."""
+        if not self.jerks:
+            return 0.0
+        import bisect
+        i = bisect.bisect_right(self.jerk_starts, t) - 1
+        if i < 0 or t - self.jerks[i][0] >= self.jerk_duration:
+            return 0.0
+        return self.jerks[i][1] * math.sin(math.pi * (t - self.jerks[i][0]) / self.jerk_duration) ** 2
+
+    def joint_positions(self, t, amp_time=None, jerk_time=None):
+        """Joint positions at t. Forecast arguments: amp_time = take the amplitude of the period containing
+        amp_time; jerk_time = use the bump offset observed at jerk_time instead of the true one at t."""
+        q = dict(self.posture)
+        if self.motion == 'sine':
+            amp = self.amplitude_at(t if amp_time is None else amp_time)
+            q[self.sine_joint] += amp * math.sin(2.0 * math.pi * t / self.sine_period)
+        if self.block_enabled:
+            w = self.block_fraction(t)
+            for joint, a, b in zip(self.block_joints, self.block_retracted, self.block_extended):
+                q[joint] = a + w * (b - a)
+        if self.jerk_enabled:
+            q[self.jerk_joint] += self.jerk_offset(t if jerk_time is None else jerk_time)
+        return q
+
+    def adaptive_horizon(self, t):
+        """Forecast horizon from the observed speed of the fastest segment (see parameters)."""
+        if self.forecast_horizon_max <= self.forecast_horizon:
+            return self.forecast_horizon
+        centres = np.array([c for c, _ in self.segment_poses(self.joint_positions(t))])
+        if self.centre_history and t < self.centre_history[-1][0]:
+            self.centre_history.clear()  # Clock went back (sim reset).
+        self.centre_history.append((t, centres))
+        while t - self.centre_history[0][0] > self.forecast_speed_window:
+            self.centre_history.popleft()
+        elapsed = t - self.centre_history[0][0]
+        if elapsed < 0.5:
+            return self.forecast_horizon
+        path = sum(np.linalg.norm(b[1] - a[1], axis=1) for a, b in zip(self.centre_history, list(self.centre_history)[1:]))
+        speed = float(np.max(path)) / elapsed
+        frac = np.clip((speed - self.forecast_speed_low) / (self.forecast_speed_high - self.forecast_speed_low), 0.0, 1.0)
+        horizon = self.forecast_horizon + frac * (self.forecast_horizon_max - self.forecast_horizon)
+        if self.current_horizon is None or abs(horizon - self.current_horizon) >= 0.25:
+            self.get_logger().info(f'Forecast horizon {horizon:.2f} s (arm speed {speed:.3f} m/s)')
+            self.current_horizon = horizon
+        return horizon
+
+    def segment_poses(self, q, segments=None):
+        """(centre [3], quaternion xyzw) of each collision cylinder (self.segments by default) in frame_id."""
+        links = self.kinematics.link_poses(q)
+        out = []
+        for _, link, offset, _, _ in (self.segments if segments is None else segments):
+            T = self.T_place @ links[link]
+            centre = T[:3, 3] + T[:3, :3] @ np.array([0.0, offset, 0.0])
+            out.append((centre, matrix_to_quat(T[:3, :3] @ Z_TO_LINK_Y)))
+        return out
+
+    def _publish_placement(self, x, y, z, yaw):
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = self.frame_id
+        t.child_frame_id = f'{self.prefix}world'
+        t.transform.translation.x, t.transform.translation.y, t.transform.translation.z = x, y, z
+        t.transform.rotation.z = math.sin(yaw / 2.0)
+        t.transform.rotation.w = math.cos(yaw / 2.0)
+        self.static_tf.sendTransform(t)
+
+    def _markers(self, t_ns, ns_suffix, rgba, amp_time=None, jerk_time=None):
+        stamp = TimeMsg(sec=int(t_ns // 1_000_000_000), nanosec=int(t_ns % 1_000_000_000))
+        markers = []
+        for idx, ((name, _, _, length, radius), (centre, quat)) in enumerate(
+                zip(self.segments, self.segment_poses(self.joint_positions(t_ns * 1e-9, amp_time, jerk_time)))):
+            m = Marker()
+            m.header.frame_id = self.frame_id
+            m.header.stamp = stamp
+            m.ns = f'urdf_human/{name}{ns_suffix}'
+            m.id = idx  # Stable (ns, id) per segment.
+            m.type = Marker.CYLINDER
+            m.action = Marker.ADD
+            m.pose.position.x, m.pose.position.y, m.pose.position.z = (float(v) for v in centre)
+            m.pose.orientation.x, m.pose.orientation.y, m.pose.orientation.z, m.pose.orientation.w = quat
+            m.scale.x = m.scale.y = 2.0 * radius  # Diameter, metres.
+            m.scale.z = length
+            m.color.r, m.color.g, m.color.b, m.color.a = rgba
+            m.lifetime.sec = 1
+            markers.append(m)
+        return markers
+
+    def _update_block_trigger(self, t):
+        """Reactive blocking: start a reach when the robot end effector approaches the trigger point."""
+        if self.block_t0 is not None and t < self.block_t0:
+            self.block_t0 = None  # clock went back (sim reset)
+        if self.block_t0 is not None and t - self.block_t0 < 2.0 * self.block_move + self.block_dwell + self.block_refractory:
+            return
+        try:
+            from rclpy.time import Time as RosTime
+            tf = self.tf_buffer.lookup_transform(self.frame_id, self.block_robot_frame, RosTime())
+        except Exception:  # TF not available yet
+            return
+        p = tf.transform.translation
+        d = float(np.linalg.norm(np.array([p.x, p.y, p.z]) - self.block_trigger_point))
+        approaching = self.block_prev_dist is not None and d < self.block_prev_dist - 1e-4
+        self.block_prev_dist = d
+        if approaching and self.block_trigger_near <= d <= self.block_trigger_far:
+            self.block_t0 = t
+            self.get_logger().info(f'[human-event] block reach starts (robot {d:.2f} m from the trigger point)')
+
+    def _publish(self):
+        now = self.get_clock().now()
+        if now.nanoseconds <= 0:
+            return
+        t = now.nanoseconds * 1e-9
+        if self.tf_buffer is not None:
+            self._update_block_trigger(t)
+
+        js = JointState()
+        js.header.stamp = now.to_msg()
+        q = self.joint_positions(t)
+        js.name = list(q.keys())
+        js.position = list(q.values())
+        self.joint_pub.publish(js)
+
+        current = self._markers(now.nanoseconds, '', (0.95, 0.3, 0.15, 0.35))  # Observed: red.
+        # Label above the head, shown by the same RViz display. The planner only reads
+        # CYLINDER/CUBE markers, so this text is ignored for collision.
+        label = Marker()
+        label.header = current[0].header
+        label.ns = 'urdf_human/label'
+        label.id = len(SEGMENTS)
+        label.type = Marker.TEXT_VIEW_FACING
+        label.action = Marker.ADD
+        # The head may not be a collision segment: place the label from its own pose.
+        (head, _), = self.segment_poses(q, [s for s in SEGMENTS if s[0] == 'head'])
+        label.pose.position.x, label.pose.position.y = float(head[0]), float(head[1])
+        label.pose.position.z = float(head[2]) + 0.25
+        label.pose.orientation.w = 1.0
+        label.scale.z = 0.05  # Text height, metres.
+        label.color.r, label.color.g, label.color.b, label.color.a = 1.0, 1.0, 1.0, 1.0
+        # No spaces: RViz2 renders a space in 3D text much wider than a letter.
+        label.text = (f'bras:{1.0 / self.sine_period:.3g}Hz' if self.motion == 'sine' else 'bras:statique')
+        if self.motion == 'sine' and self.sine_amplitudes is not None:  # current amplitude of the alternation
+            label.text += f'_amp{self.amplitude_at(t):.2f}rad'
+        if self.block_enabled and self.block_fraction(t) > 0.5:
+            label.text += '_main:B'
+        if self.jerk_enabled and self.jerk_offset(t) != 0.0:
+            label.text += '_rapide'
+        label.lifetime.sec = 1
+        self.marker_pub.publish(MarkerArray(markers=current + [label]))
+        if self.forecast_pub is not None:
+            # Same segments in the same order for each future time; header.stamp is the predicted time.
+            forecast = []
+            horizon = self.adaptive_horizon(t)
+            offsets = self.forecast_dt * np.arange(int(round(horizon / self.forecast_dt)) + 1)
+            for k, dt in enumerate(offsets):
+                # markers = self._markers(now.nanoseconds + int(round(dt * 1e9)), f'/k{k}', (0.2, 0.5, 1.0, 0.15))
+                # markers = self._markers(now.nanoseconds + int(round(dt * 1e9)), f'/k{k}', (0.2, 0.5, 1.0, 0.15),
+                #                         amp_time=None if self.forecast_knows_switch else t)
+                markers = self._markers(now.nanoseconds + int(round(dt * 1e9)), f'/k{k}', (0.2, 0.5, 1.0, 0.15),
+                                        amp_time=None if self.forecast_knows_switch else t,
+                                        jerk_time=None if self.forecast_knows_jerks else t)
+                for m, (name, *_) in zip(markers, self.segments):  # Predicted: blue.
+                    if k % self.forecast_display_every or name not in self.moving_segments:
+                        m.color.a = 0.0
+                forecast += markers
+            self.forecast_pub.publish(MarkerArray(markers=forecast))
+
+
+def main():
+    rclpy.init()
+    node = UrdfHuman()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

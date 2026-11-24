@@ -35,6 +35,7 @@ from ...differentiable_robot_model.coordinate_transform import matrix_to_quatern
 from ...mpc.model.integration_utils import build_fd_matrix
 from ...mpc.rollout.rollout_base import RolloutBase
 from ..cost.robot_self_collision_cost import RobotSelfCollisionCost
+from ..cost.human_proximity_cost import HumanProximityCost  # Point 3
 
 # Placeholder world for box_collision_cost/table_collision_cost at construction time -- the
 # real content arrives via update_params(box_world_params=..., table_world_params=...) right
@@ -67,6 +68,11 @@ class ArmBase(RolloutBase):
         self.cat_primitive_collision_violation_scale = cat_pc_cfg.get('violation_scale', None)
         if self.cat_primitive_collision_violation_scale is not None:
             self.cat_primitive_collision_violation_scale = float(self.cat_primitive_collision_violation_scale)
+        # Hard zone (off unless mppi.cat_primitive_collision.core_distance is set): violation > 0 when any
+        # robot sphere is closer than core_distance [m] to the human arm; MPPI turns it into a CaT
+        # termination probability rising to core_p_max (1 by default) at contact, on top of the 10 cm margin.
+        core = cat_pc_cfg.get('core_distance', None)
+        self.cat_primitive_collision_core_distance = float(core) if core is not None else None
         cat_sb_cfg = self.exp_params.get('mppi', {}).get('cat_state_bound', {})
         self.cat_state_bound_enabled = bool(cat_sb_cfg.get('enabled', False))
         self.cat_self_enabled = bool(mppi_params.get('cat_self_collision', {}).get('enabled',False))
@@ -167,6 +173,15 @@ class ArmBase(RolloutBase):
         if(exp_params['cost']['primitive_collision']['weight'] > 0.0 or self.cat_primitive_collision_enabled):
             self.primitive_collision_cost = PrimitiveCollisionCost(world_params=world_params, robot_params=robot_params, tensor_args=self.tensor_args, **self.exp_params['cost']['primitive_collision'])
 
+        # Point 3: anticipatory cost on the clearance to the human arm (dynamic spheres only).
+        # Off when the YAML has no human_proximity section or both weights are 0.
+        self.human_proximity_cost = None
+        hp_cfg = exp_params['cost'].get('human_proximity', {}) or {}
+        if hp_cfg.get('weight', 0.0) > 0.0 or hp_cfg.get('cbf_weight', 0.0) > 0.0:
+            if self.primitive_collision_cost is None:
+                raise ValueError("human_proximity needs primitive_collision (it reuses its human-arm distances).")
+            self.human_proximity_cost = HumanProximityCost(tensor_args=self.tensor_args, **hp_cfg)
+
         # Dedicated collision costs for pick-object boxes and the table, kept separate from
         # primitive_collision_cost above so each gets its own threshold/weight (typically
         # distance_threshold: 0.0 for boxes -- only real contact/penetration counts, no
@@ -257,6 +272,9 @@ class ArmBase(RolloutBase):
                     "primitive_collision_violation": primitive_violation,
                     "state_bound_costs": state_bound_cost,
                     "state_bound_violation": state_bound_violation,
+                    "table_collision_costs": torch.zeros_like(cost),
+                    "table_collision_violation": torch.zeros_like(cost),
+                    "primitive_collision_core_violation": torch.zeros_like(cost),
                 }
             return cost
         if(self.exp_params['cost']['manipulability']['weight'] > 0.0):
@@ -349,6 +367,20 @@ class ArmBase(RolloutBase):
                     coll_cost = self.primitive_collision_cost.forward(link_pos_batch, link_rot_batch)
                     cost += coll_cost
 
+                # Point 3: reuse the human-arm distances primitive_collision just computed.
+                dyn = self.primitive_collision_cost.last_dynamic_link_dist
+                if self.human_proximity_cost is not None and dyn is not None and dyn.shape[0] == cost.numel():
+                    _c = self.human_proximity_cost.forward(dyn.view(cost.shape[0], cost.shape[1], -1))
+                    cost += _c
+                    if breakdown is not None:
+                        breakdown["human_proximity"] = _c
+                # Hard zone: overlap with the human arm grown by core_distance (> 0 = closer than core).
+                if (breakdown is not None and self.cat_primitive_collision_core_distance is not None
+                        and dyn is not None and dyn.shape[0] == cost.numel()):
+                    closest = torch.amax(dyn.view(cost.shape[0], cost.shape[1], -1), dim=-1)  # -clearance
+                    breakdown["primitive_collision_core_violation"] = torch.clamp(
+                        closest + self.cat_primitive_collision_core_distance, min=0.0).to(cost.dtype)
+
             if self.box_collision_cost is not None:
                 box_cost = self.box_collision_cost.forward(link_pos_batch, link_rot_batch)
                 cost += box_cost
@@ -356,10 +388,16 @@ class ArmBase(RolloutBase):
                     breakdown["box_collision"] = box_cost
 
             if self.table_collision_cost is not None:
-                table_cost = self.table_collision_cost.forward(link_pos_batch, link_rot_batch)
+                # table_cost = self.table_collision_cost.forward(link_pos_batch, link_rot_batch)
+                # Also return the violation so MPPI can treat the table as a CaT constraint
+                # (mppi.cat_table_collision); the cost itself is unchanged.
+                table_cost, table_violation = self.table_collision_cost.forward(
+                    link_pos_batch, link_rot_batch, return_violation=True)
                 cost += table_cost
                 if breakdown is not None:
                     breakdown["table_collision"] = table_cost
+                    breakdown["table_collision_costs"] = table_cost
+                    breakdown["table_collision_violation"] = table_violation
 
             if self.exp_params['cost']['voxel_collision']['weight'] > 0:
                 coll_cost = self.voxel_collision_cost.forward(link_pos_batch, link_rot_batch)
@@ -378,6 +416,9 @@ class ArmBase(RolloutBase):
         if return_breakdown:
             breakdown["self_collision_costs"] = self_cost
             breakdown["self_collision_violation"] = self_violation
+            breakdown.setdefault("table_collision_costs", torch.zeros_like(cost))  # no table cost configured
+            breakdown.setdefault("table_collision_violation", torch.zeros_like(cost))
+            breakdown.setdefault("primitive_collision_core_violation", torch.zeros_like(cost))  # hard zone off / no human
             breakdown["joint_torque"] = torque_cost
             breakdown["joint_torque_costs"] = torque_cost
             breakdown["joint_torque_violation"] = torque_violation
@@ -433,7 +474,9 @@ class ArmBase(RolloutBase):
         _skip = {"primitive_collision_costs", "primitive_collision_violation",
                  "state_bound_costs", "state_bound_violation",
                  "joint_torque_costs", "joint_torque_violation",
-                 "self_collision_costs", "self_collision_violation"}
+                 "self_collision_costs", "self_collision_violation",
+                 "table_collision_costs", "table_collision_violation",  # table: already logged as table_collision
+                 "primitive_collision_core_violation"}
         self.last_cost_breakdown = {
             k: float(v.sum(dim=-1).mean().item())
             for k, v in cost_breakdown.items()
@@ -443,6 +486,8 @@ class ArmBase(RolloutBase):
         sim_trajs = dict(
             self_collision_costs=cost_breakdown["self_collision_costs"],
             self_collision_violation=cost_breakdown["self_collision_violation"],
+            table_collision_costs=cost_breakdown["table_collision_costs"],
+            table_collision_violation=cost_breakdown["table_collision_violation"],
             joint_torque_costs=cost_breakdown["joint_torque_costs"],
             joint_torque_violation=cost_breakdown["joint_torque_violation"],
             actions=act_seq,
@@ -451,6 +496,7 @@ class ArmBase(RolloutBase):
             rollout_time=0.0,
             primitive_collision_costs=cost_breakdown["primitive_collision_costs"],
             primitive_collision_violation=cost_breakdown["primitive_collision_violation"],
+            primitive_collision_core_violation=cost_breakdown["primitive_collision_core_violation"],
             state_bound_costs=cost_breakdown["state_bound_costs"],
             state_bound_violation=cost_breakdown["state_bound_violation"],
         )

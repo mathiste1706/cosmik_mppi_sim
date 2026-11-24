@@ -7,6 +7,7 @@ import re
 import sys
 import time
 import xml.etree.ElementTree as ET
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -14,7 +15,7 @@ from typing import Optional
 import numpy as np
 import pinocchio as pin
 import rclpy
-from geometry_msgs.msg import Point, PoseArray, PoseStamped
+from geometry_msgs.msg import Point, Pose, PoseArray, PoseStamped
 from linear_feedback_controller_msgs.msg import Control, Sensor
 from linear_feedback_controller_msgs_py.numpy_conversions import matrix_numpy_to_msg
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
@@ -203,6 +204,11 @@ class StormMppiPlannerNode(Node):
         self._goal_pose_msg: Optional[PoseStamped] = None
         self._objects_markers_msg: Optional[MarkerArray] = None
         self._collision_markers_msg: Optional[MarkerArray] = None
+        self._collision_forecast_msg: Optional[MarkerArray] = None
+        self._collision_forecast_rx_ns: int = 0
+        self._collision_forecast_applied_msg: Optional[MarkerArray] = None
+        self._collision_forecast_active = False
+        self._rtf_samples: deque[tuple[float, float]] = deque()
         self._collision_poses_msg: Optional[PoseArray] = None
         self._robot_description_msg: Optional[String] = None
 
@@ -265,6 +271,9 @@ class StormMppiPlannerNode(Node):
 
         self._storm_initialized = False
         self._storm_task = None
+        # Optional posture per goal side, from cost.retract_state_by_goal_y in the task YAML.
+        self._retract_by_goal_y: Optional[dict] = None
+        self._retract_goal_side: Optional[str] = None
         self._storm_control_dt: Optional[float] = None
         self._storm_model_dt: Optional[float] = None
         self._storm_traj_base_dt: Optional[float] = None
@@ -337,6 +346,15 @@ class StormMppiPlannerNode(Node):
         self._collision_markers_topic_resolved = ""
         self._sub_collision_markers = None
         self._collision_markers_autodiscovery_timer = None
+        collision_forecast_topic = str(self.get_parameter("collision_forecast_topic").value).strip()
+        if collision_forecast_topic:
+            self.create_subscription(
+                MarkerArray,
+                collision_forecast_topic,
+                self._collision_forecast_callback,
+                qos_profile=QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE),
+            )
+            self.get_logger().info(f"Using collision forecast MarkerArray topic: {collision_forecast_topic}")
         if collision_markers_topic:
             self._create_collision_markers_subscription(collision_markers_topic)
         elif auto_discover_collision_topic:
@@ -451,6 +469,35 @@ class StormMppiPlannerNode(Node):
                 description="Additional MarkerArray topic for collision primitives. "
                 "CUBE and CYLINDER markers are converted to MPPI collision objects. "
                 "Empty string enables autodiscovery.",
+            ),
+        )
+        self.declare_parameter(
+            "collision_forecast_topic",
+            "",
+            ParameterDescriptor(
+                type=ParameterType.PARAMETER_STRING,
+                description="Optional MarkerArray forecast of collision_markers_topic (dynamic mode only): "
+                "the same markers, in the same order, repeated for several future times, each marker's "
+                "header.stamp being its predicted time. MPPI then evaluates rollout step k against the "
+                "geometry predicted for that step. Empty string disables (observed geometry is held).",
+            ),
+        )
+        self.declare_parameter(
+            "mppi_multimodal",
+            False,
+            ParameterDescriptor(
+                type=ParameterType.PARAMETER_BOOL,
+                description="Multimodal MPPI: sample families seeded to move the end effector up or down "
+                "besides the direct one; each family updates its own mean and MPPI executes the family "
+                "with the best cost (e.g. passing above or below a predicted human limb).",
+            ),
+        )
+        self.declare_parameter(
+            "collision_forecast_timeout_s",
+            0.5,
+            ParameterDescriptor(
+                type=ParameterType.PARAMETER_DOUBLE,
+                description="Drop the forecast (back to held observed geometry) if none arrived for this long.",
             ),
         )
         self.declare_parameter(
@@ -1025,6 +1072,10 @@ class StormMppiPlannerNode(Node):
         self._collision_markers_msg = msg
         self._world_inputs_dirty = True
 
+    def _collision_forecast_callback(self, msg: MarkerArray) -> None:
+        self._collision_forecast_msg = msg
+        self._collision_forecast_rx_ns = self.get_clock().now().nanoseconds
+
     def _collision_poses_callback(self, msg: PoseArray) -> None:
         self._collision_poses_msg = msg
         self._world_inputs_dirty = True
@@ -1190,9 +1241,14 @@ class StormMppiPlannerNode(Node):
             world_file=cfg.world_file,
             tensor_args=self._storm_tensor_args,
             world_params=world_params,
+            mppi_overrides=(
+                {"multimodal": {"enabled": True}} if bool(self.get_parameter("mppi_multimodal").value) else None
+            ),
         )
+        self._mppi_active_family: Optional[str] = None
         cost_cfg = task.exp_params.get("cost", {})
         mppi_cfg = task.exp_params.get("mppi", {})
+        self._retract_by_goal_y = cost_cfg.get("retract_state_by_goal_y")
         primitive_weight = float(cost_cfg.get("primitive_collision", {}).get("weight", math.nan))
         collision_weight = float(cost_cfg.get("collision", {}).get("weight", math.nan))
         cat_pc_enabled = bool(mppi_cfg.get("cat_primitive_collision", {}).get("enabled", False))
@@ -1243,6 +1299,9 @@ class StormMppiPlannerNode(Node):
             box_world_params=self._filter_box_world_params(box_world_params),
             table_world_params=table_world_params,
         )
+        self._log_replay_input("world_init", world_params=world_params,  # replay diagnostic
+                               box_world_params=self._filter_box_world_params(box_world_params),
+                               table_world_params=table_world_params)
         self._storm_control_dt = float(task.exp_params["control_dt"])
         self._storm_model_dt = float(task.exp_params["model"]["dt"])
         dt_traj_params = dict(task.exp_params["model"].get("dt_traj_params", {}))
@@ -1654,6 +1713,28 @@ class StormMppiPlannerNode(Node):
         world["world_model"] = world_model
         return world
 
+    def _log_replay_input(self, kind: str, **payload) -> None:
+        """Replay diagnostic: one 'REPLAY_INPUT <kind> <json>' log line with exactly what STORM receives
+        (goal in the STORM ee frame, partitioned world params), so an offline replay can use the same inputs.
+        Logging only; no effect on planning."""
+        import json  # local: diagnostic only
+
+        def _plain(v):
+            if isinstance(v, np.ndarray):
+                return v.tolist()
+            if isinstance(v, dict):
+                return {str(k): _plain(x) for k, x in v.items()}
+            if isinstance(v, (list, tuple)):
+                return [_plain(x) for x in v]
+            if isinstance(v, (np.floating, np.integer)):
+                return v.item()
+            return v
+
+        try:
+            self.get_logger().info(f"REPLAY_INPUT {kind} {json.dumps(_plain(payload), default=str)}")
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"REPLAY_INPUT {kind} could not be logged: {exc}")
+
     def _maybe_log_world_collision_objects(self, world_params: dict, *, source: str) -> None:
         if not bool(self.get_parameter("debug_collision_objects").value):
             return
@@ -1752,45 +1833,60 @@ class StormMppiPlannerNode(Node):
             throttle_duration_sec=1.0,
         )
 
+    def _marker_dynamic_observations(
+        self,
+        markers,
+        base_frame_name: str,
+        ignored_ns: set[str],
+    ) -> list[_DynamicCollisionObservation]:
+        observations: list[_DynamicCollisionObservation] = []
+        # A forecast holds hundreds of markers in one frame: look the frame up once.
+        frame_transforms: dict[str, Optional[pin.SE3]] = {}
+        for marker in markers:
+            if marker.action in (Marker.DELETE, Marker.DELETEALL):
+                continue
+            if marker.ns and str(marker.ns) in ignored_ns:
+                continue
+            if int(marker.type) not in (int(Marker.CYLINDER), int(Marker.CUBE)):
+                continue
+
+            marker_frame = str(marker.header.frame_id) if marker.header.frame_id else base_frame_name
+            if marker_frame not in frame_transforms:
+                frame_transforms[marker_frame] = self._pose_in_base_frame(Pose(), marker_frame, base_frame_name)
+            base_T_frame = frame_transforms[marker_frame]
+            if base_T_frame is None:
+                continue
+            marker_M = base_T_frame * pose_msg_to_se3(marker.pose)
+
+            # Dynamic mode uses sphere chains.
+            # For CUBE markers use a conservative circumscribed radius in XY
+            # so we do not under-approximate cube corners.
+            if int(marker.type) == int(Marker.CUBE):
+                radius = 0.5 * float(math.hypot(marker.scale.x, marker.scale.y))
+            else:
+                radius = 0.5 * float(max(marker.scale.x, marker.scale.y))
+            height = float(marker.scale.z)
+            if radius <= 0.0 or height <= 0.0:
+                continue
+
+            observations.append(
+                _DynamicCollisionObservation(
+                    kind="cylinder",
+                    center=marker_M.translation.astype(np.float64, copy=True),
+                    rotation=marker_M.rotation.astype(np.float64, copy=True),
+                    radius=radius,
+                    height=height,
+                )
+            )
+        return observations
+
     def _collect_dynamic_collision_observations(self, base_frame_name: str) -> list[_DynamicCollisionObservation]:
         observations: list[_DynamicCollisionObservation] = []
         ignored_ns = {str(x) for x in self.get_parameter("ignore_collision_namespaces").value}
 
         markers_msg = self._collision_markers_msg
         if markers_msg is not None:
-            for marker in markers_msg.markers:
-                if marker.action in (Marker.DELETE, Marker.DELETEALL):
-                    continue
-                if marker.ns and str(marker.ns) in ignored_ns:
-                    continue
-                if int(marker.type) not in (int(Marker.CYLINDER), int(Marker.CUBE)):
-                    continue
-
-                marker_frame = str(marker.header.frame_id) if marker.header.frame_id else base_frame_name
-                marker_M = self._pose_in_base_frame(marker.pose, marker_frame, base_frame_name)
-                if marker_M is None:
-                    continue
-
-                # Dynamic mode uses sphere chains.
-                # For CUBE markers use a conservative circumscribed radius in XY
-                # so we do not under-approximate cube corners.
-                if int(marker.type) == int(Marker.CUBE):
-                    radius = 0.5 * float(math.hypot(marker.scale.x, marker.scale.y))
-                else:
-                    radius = 0.5 * float(max(marker.scale.x, marker.scale.y))
-                height = float(marker.scale.z)
-                if radius <= 0.0 or height <= 0.0:
-                    continue
-
-                observations.append(
-                    _DynamicCollisionObservation(
-                        kind="cylinder",
-                        center=marker_M.translation.astype(np.float64, copy=True),
-                        rotation=marker_M.rotation.astype(np.float64, copy=True),
-                        radius=radius,
-                        height=height,
-                    )
-                )
+            observations += self._marker_dynamic_observations(markers_msg.markers, base_frame_name, ignored_ns)
 
         poses_msg = self._collision_poses_msg
         if poses_msg is not None:
@@ -2029,8 +2125,111 @@ class StormMppiPlannerNode(Node):
             box_world_params=self._filter_box_world_params(box_world_params),
             table_world_params=table_world_params,
         )
+        self._log_replay_input("world_dynamic_static_update", world_params=world_params,  # replay diagnostic
+                               box_world_params=self._filter_box_world_params(box_world_params),
+                               table_world_params=table_world_params)
         self._last_dynamic_objects_signature = objects_signature
         return True
+
+    def _real_time_factor(self, now_ns: int) -> float:
+        """ROS-time seconds per t_step (wall) second, measured over the last few seconds."""
+        perf = time.perf_counter()
+        samples = self._rtf_samples
+        samples.append((perf, now_ns * 1e-9))
+        while len(samples) > 2 and perf - samples[0][0] > 3.0:
+            samples.popleft()
+        span = samples[-1][0] - samples[0][0]
+        if span < 1.0:
+            return 1.0
+        return float(np.clip((samples[-1][1] - samples[0][1]) / span, 0.1, 2.0))
+
+    def _maybe_dump_forecast_debug(self, t_step: float) -> None:
+        """Diagnostic: every 0.5 s, save the forecast MPPI received (sampled at its rollout
+        times) next to the observed spheres. Enabled by STORM_FORECAST_DEBUG_DIR."""
+        out_dir = os.environ.get("STORM_FORECAST_DEBUG_DIR")
+        if not out_dir or self._storm_task is None:
+            return
+        if t_step - getattr(self, "_forecast_debug_last", -1.0) < 0.5:
+            return
+        self._forecast_debug_last = t_step
+        query = getattr(getattr(self._storm_task, "control_process", None), "last_forecast_query", None)
+        observed = self._dynamic_world_spheres_np
+        os.makedirs(out_dir, exist_ok=True)
+        np.savez(
+            os.path.join(out_dir, f"{int(t_step * 1000):08d}.npz"),
+            t_step=t_step,
+            ros_now=self.get_clock().now().nanoseconds * 1e-9,
+            observed=np.zeros((0, 4)) if observed is None else observed,
+            sampled=np.zeros((0, 0, 4)) if query is None else query["sampled"],
+            query=np.array([np.nan] * 4) if query is None else np.array(
+                [query["t_start"], query["times_first"], query["times_last"], query["rollout_span"]]),
+            forecast_active=bool(self._collision_forecast_active),
+        )
+
+    def _maybe_update_dynamic_forecast(self, t_step: float) -> None:
+        """Hand the latest collision forecast to the control process (dynamic mode only).
+
+        Forecast stamps are ROS times; the control process samples the forecast at its
+        rollout times in the t_step clock (perf_counter since start), which drives command
+        timing. A ROS-time offset dt from now is reached after dt / RTF wall seconds.
+        """
+        if self._storm_task is None or not bool(self.get_parameter("dynamic_collision_mode").value):
+            return
+        msg = self._collision_forecast_msg
+        if msg is None:
+            return
+        now_ns = self.get_clock().now().nanoseconds
+        rtf = self._real_time_factor(now_ns)
+        timeout_s = float(self.get_parameter("collision_forecast_timeout_s").value)
+        if (now_ns - self._collision_forecast_rx_ns) * 1e-9 > timeout_s:
+            if self._collision_forecast_active:
+                self._storm_task.set_dynamic_world_forecast(None, None)
+                self._collision_forecast_active = False
+                self._world_inputs_dirty = True  # Resend the held [N, 4] observation.
+                self.get_logger().warn("Collision forecast timed out; holding the observed geometry.")
+            return
+        if msg is self._collision_forecast_applied_msg:
+            return
+        self._collision_forecast_applied_msg = msg
+
+        base_frame_name = str(self.get_parameter("base_frame_name").value)
+        ignored_ns = {str(x) for x in self.get_parameter("ignore_collision_namespaces").value}
+        slices: dict[int, list] = {}
+        for marker in msg.markers:
+            stamp_ns = int(marker.header.stamp.sec) * 1_000_000_000 + int(marker.header.stamp.nanosec)
+            slices.setdefault(stamp_ns, []).append(marker)
+        stamps = sorted(slices)
+        if not stamps:
+            return
+
+        # Each slice uses the same slot layout as the observed markers. The layout helper
+        # writes into the shared [N, 4] buffer, so keep the observed spheres intact.
+        observed = None if self._dynamic_world_spheres_np is None else self._dynamic_world_spheres_np.copy()
+        spheres = []
+        try:
+            for stamp_ns in stamps:
+                observations = self._marker_dynamic_observations(slices[stamp_ns], base_frame_name, ignored_ns)
+                slice_spheres = self._update_dynamic_world_spheres_from_observations(observations)
+                if slice_spheres is None:
+                    return
+                spheres.append(slice_spheres.copy())
+        finally:
+            if observed is not None and self._dynamic_world_spheres_np is not None:
+                self._dynamic_world_spheres_np[...] = observed
+
+        times = t_step + (np.asarray(stamps, dtype=np.float64) - now_ns) * 1e-9 / rtf
+        self._storm_task.set_dynamic_world_forecast(times, np.stack(spheres))
+        if not self._collision_forecast_active:
+            self.get_logger().info(
+                f"Collision forecast active: {len(stamps)} steps over {(stamps[-1] - stamps[0]) * 1e-9:.2f} s, "
+                f"{spheres[0].shape[0]} spheres per step."
+            )
+        self.get_logger().info(
+            f"Collision forecast timing: real-time factor {rtf:.3f}, forecast age "
+            f"{(now_ns - stamps[0]) * 1e-6:.1f} ms.",
+            throttle_duration_sec=5.0,
+        )
+        self._collision_forecast_active = True
 
     def _maybe_update_dynamic_collision_inputs(self) -> None:
         if not self._storm_initialized or self._storm_task is None:
@@ -2111,6 +2310,9 @@ class StormMppiPlannerNode(Node):
             box_world_params=self._filter_box_world_params(box_world_params),
             table_world_params=table_world_params,
         )
+        self._log_replay_input("world_update", world_params=world_params,  # replay diagnostic
+                               box_world_params=self._filter_box_world_params(box_world_params),
+                               table_world_params=table_world_params)
         self._last_world_inputs_signature = signature
         self._last_world_inputs_apply_time = now
         self._world_inputs_dirty = False
@@ -2561,7 +2763,18 @@ class StormMppiPlannerNode(Node):
             or float(np.linalg.norm(goal_xyzquat - self._last_goal_storm_ee_xyzquat)) > 1.0e-6
         ):
             self._storm_task.update_params(goal_ee_pos=goal_ee_pos, goal_ee_rot=goal_ee_rot)
+            self._log_replay_input("goal", goal_ee_pos=goal_ee_pos, goal_ee_rot=goal_ee_rot,  # replay diagnostic
+                                   goal_ros_xyzquat=pin.SE3ToXYZQUAT(goal_M))
             self._last_goal_storm_ee_xyzquat = goal_xyzquat
+            if self._retract_by_goal_y:
+                # Only the posture cost changes: MPPI stays free to pick its motion.
+                side = "negative" if goal_ee_pos[1] < 0.0 else "positive"
+                if side != self._retract_goal_side:
+                    self._storm_task.update_params(
+                        retract_state=np.asarray(self._retract_by_goal_y[side], dtype=np.float32)
+                    )
+                    self._retract_goal_side = side
+                    self.get_logger().info(f"Posture target for {side} goal y: {self._retract_by_goal_y[side]}")
 
         if self._gripper_width is not None and self._last_box_world_params_raw is not None:
             open_width = float(self.get_parameter("gripper_open_width").value)
@@ -2571,6 +2784,8 @@ class StormMppiPlannerNode(Node):
                 self._storm_task.update_params(
                     box_world_params=self._filter_box_world_params(self._last_box_world_params_raw)
                 )
+                self._log_replay_input("box_gripper_update", gripper_is_open=gripper_is_open,  # replay diagnostic
+                                       box_world_params=self._filter_box_world_params(self._last_box_world_params_raw))
                 self._last_gripper_is_open = gripper_is_open
 
         if not self._armed:
@@ -2591,11 +2806,18 @@ class StormMppiPlannerNode(Node):
             "velocity": self._np_dq.astype(np.float32, copy=True),
             "acceleration": np.zeros_like(self._np_q, dtype=np.float32),
         }
+        self._maybe_update_dynamic_forecast(t_step)
         cmd_t0 = time.perf_counter()
         cmd_des = self._storm_task.get_command(
             t_step, curr_state, control_dt=float(self._storm_control_dt), WAIT=False
         )
+        self._maybe_dump_forecast_debug(t_step)
         cmd_wall_dt = float(time.perf_counter() - cmd_t0)
+        family = getattr(self._storm_task, "multimodal", {}) or {}
+        if family.get("active") and family["active"] != self._mppi_active_family:
+            scores = ", ".join(f"{k}={v:.1f}" for k, v in family.get("scores", {}).items())
+            self.get_logger().info(f"[mppi-family] active={family['active']} (scores: {scores})")
+            self._mppi_active_family = family["active"]
         if debug_mppi_rate:
             alpha = 0.90
             if tick_dt is not None and tick_dt > 0.0:
@@ -2627,6 +2849,13 @@ class StormMppiPlannerNode(Node):
                 if breakdown:
                     parts = "  |  ".join(f"{k}: {v:.2f}" for k, v in breakdown.items())
                     self.get_logger().info(f"MPPI costs:  {parts}", throttle_duration_sec=1.0)
+                exec_costs = getattr(self._storm_task, "exec_costs", {}) or {}
+                if exec_costs:
+                    plans = "  ||  ".join(
+                        f"{label}: " + "  |  ".join(f"{k}: {v:.2f}" for k, v in terms.items())
+                        for label, terms in exec_costs.items()
+                    )
+                    self.get_logger().info(f"MPPI plan costs:  {plans}", throttle_duration_sec=1.0)
 
                 cov_diag = getattr(self._storm_task, "cov_diagonal", None)
                 if cov_diag:

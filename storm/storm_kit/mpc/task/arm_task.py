@@ -41,19 +41,21 @@ class ArmTask(BaseTask):
         world_file="collision_env.yml",
         tensor_args={"device": "cpu", "dtype": torch.float32},
         world_params=None,
+        mppi_overrides=None,
     ):
 
         super().__init__(tensor_args=tensor_args)
 
 
-        self.controller = self.init_mppi(task_file, robot_file, world_file, world_params=world_params)
+        self.controller = self.init_mppi(task_file, robot_file, world_file, world_params=world_params,
+                                         mppi_overrides=mppi_overrides)
         self.init_aux()
 
     def get_rollout_fn(self, **kwargs):
         rollout_fn = ArmBase(**kwargs)
         return rollout_fn
 
-    def init_mppi(self, task_file, robot_file, collision_file, world_params=None):
+    def init_mppi(self, task_file, robot_file, collision_file, world_params=None, mppi_overrides=None):
         robot_yml = join_path(get_gym_configs_path(), robot_file)
 
         with open(robot_yml) as file:
@@ -68,6 +70,8 @@ class ArmTask(BaseTask):
 
         with open(mpc_yml_file) as file:
             exp_params = yaml.safe_load(file)
+        # Top-level mppi keys set by the caller (e.g. multimodal) without editing the task YAML.
+        exp_params['mppi'].update(mppi_overrides or {})
         exp_params['robot_params'] = exp_params['model'] #robot_params
 
 

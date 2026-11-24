@@ -9,6 +9,7 @@ ament_python_install_package(${PROJECT_NAME})
 
 install(PROGRAMS
   scripts/synthetic_capsules
+  scripts/urdf_human
   scripts/pick_place_task_manager_node
   scripts/object_manager_node
   DESTINATION lib/${PROJECT_NAME}
@@ -20,4 +21,4 @@ if(BUILD_TESTING)
   ament_auto_find_test_dependencies()
 endif()
 
-ament_auto_package(INSTALL_TO_SHARE config launch rviz urdf)
+ament_auto_package(INSTALL_TO_SHARE config launch meshes rviz urdf)

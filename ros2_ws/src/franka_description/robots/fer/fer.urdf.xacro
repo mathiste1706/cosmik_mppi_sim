@@ -59,7 +59,7 @@
   <xacro:arg name="robot_safety_distance" default="0.03" />
 
   <!-- Initial configuration used in Gazebo -->
-  <xacro:arg name="initial_joint_position" default="0.0 -0.78 0.0 -2.35 0.0 1.57 0.78 0.0" />
+  <xacro:arg name="initial_joint_position" default="-1.57 -0.78 0.0 -2.35 0.0 1.57 -0.79 0.0" />
 
   <xacro:franka_robot arm_id="fer"
                       joint_limits="${xacro.load_yaml('$(find franka_description)/robots/fer/joint_limits.yaml')}"

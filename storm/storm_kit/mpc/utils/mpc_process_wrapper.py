@@ -74,11 +74,16 @@ class ControlProcess(object):
         self.cost_breakdown = {}
         self.cov_diag = None
         self.phase_timing = {}
+        self.multimodal = {}
+        self.exec_costs = {}
         self.control_space = control_space
         # Set by request_reset(), consumed by the next get_command() -> optimize_process round
         # trip (see request_reset's docstring for why this exists).
         self._reset_requested = False
-        
+        # Latest obstacle forecast (times [K] in the t_step clock, spheres [K, N, 4]); see
+        # set_dynamic_world_forecast. Resampled for every optimization request.
+        self._dynamic_forecast = None
+
         #
         self.result_queue = Queue(maxsize=1)
         self.opt_queue = Queue(maxsize=1)
@@ -201,6 +206,17 @@ class ControlProcess(object):
 
             curr_state = np.append(curr_state, t_step + self.mpc_dt)
 
+            if self._dynamic_forecast is not None:
+                # The optimizer starts from the state predicted at t_step + mpc_dt.
+                sampled = self.sample_dynamic_forecast(t_step + self.mpc_dt)
+                self.params = {**(self.params or {}), 'dynamic_world_spheres': sampled}
+                # Diagnostic: rollout start vs forecast span, and what each rollout step sees.
+                self.last_forecast_query = {'t_start': t_step + self.mpc_dt,
+                                            'times_first': float(self._dynamic_forecast[0][0]),
+                                            'times_last': float(self._dynamic_forecast[0][-1]),
+                                            'rollout_span': float(self.traj_tstep[-1]),
+                                            'sampled': sampled}
+
             # planned command:
 
             shift_steps = find_first_idx(self.command_tstep, t_step + self.mpc_dt) #- 1
@@ -236,7 +252,9 @@ class ControlProcess(object):
             self.cost_breakdown = command_data.get('cost_breakdown', {})
             self.cov_diag = command_data.get('cov_diag')
             self.phase_timing = command_data.get('phase_timing', {})
-            
+            self.multimodal = command_data.get('multimodal', {})
+            self.exec_costs = command_data.get('exec_costs', {})
+
             
             
         # send to process
@@ -265,7 +283,41 @@ class ControlProcess(object):
         # clobbered each other here since the second call's kwargs fully replaced the first's.
         self.params = {**(self.params or {}), **kwargs}
 
- 
+    def set_dynamic_world_forecast(self, times, spheres):
+        """Store a time-indexed obstacle forecast, or clear it with times=None.
+
+        times: [K] increasing, in the same clock as get_command's t_step.
+        spheres: [K, N, 4] predicted [x, y, z, r] at each time.
+        Each optimization request then carries [H, N, 4] spheres sampled at its own
+        rollout times. After clearing, send [N, 4] spheres again to leave forecast mode.
+        """
+        if times is None:
+            self._dynamic_forecast = None
+            return
+        times = np.asarray(times, dtype=np.float64).reshape(-1)
+        spheres = np.asarray(spheres, dtype=np.float32)
+        if spheres.ndim != 3 or spheres.shape[0] != times.shape[0] or spheres.shape[2] != 4:
+            raise ValueError(f"forecast needs times [K] and spheres [K, N, 4], got {times.shape} and {spheres.shape}")
+        if times.shape[0] == 0 or np.any(np.diff(times) <= 0.0):
+            raise ValueError("forecast times must be non-empty and strictly increasing")
+        self._dynamic_forecast = (times, spheres)
+
+    def sample_dynamic_forecast(self, t_start):
+        """Linearly interpolate the forecast at each rollout time t_start + traj_tstep[k].
+
+        Rollout state k is reached at t_start + traj_tstep[k] (cumulative step dt).
+        Times outside the forecast hold its first/last sample.
+        """
+        times, spheres = self._dynamic_forecast
+        query = float(t_start) + np.asarray(self.traj_tstep, dtype=np.float64)
+        if times.shape[0] == 1:
+            return np.repeat(spheres, query.shape[0], axis=0)
+        idx = np.clip(np.searchsorted(times, query, side='right') - 1, 0, times.shape[0] - 2)
+        w = np.clip((query - times[idx]) / (times[idx + 1] - times[idx]), 0.0, 1.0).astype(np.float32)
+        w = w[:, None, None]
+        return (1.0 - w) * spheres[idx] + w * spheres[idx + 1]
+
+
     def close(self):
         self.done = True
         if self.opt_process is not None:
@@ -358,7 +410,7 @@ def optimize_process(control_string, opt_queue, result_queue):
                 link_spheres = collision.robot_world_coll.robot_coll.get_batch_robot_link_spheres()
                 world = collision._dynamic_world_spheres
                 geometry_metadata = dict(robot_spheres_per_link=[int(v.shape[1]) for v in link_spheres],
-                    human_spheres=0 if world is None else int(world.shape[0]))
+                    human_spheres=0 if world is None else int(world.shape[-2]))
             timing_file.write(json.dumps(dict(t_step=float(opt_data['t_step']),
                 solve_ms=1000*(benchmark_end-benchmark_start),
                 wall_start_s=benchmark_start,wall_end_s=benchmark_end,
@@ -412,7 +464,9 @@ def optimize_process(control_string, opt_queue, result_queue):
                   'effective_sample_size': effective_sample_size,
                   'cost_breakdown': cost_breakdown,
                   'cov_diag': cov_diag,
-                  'phase_timing': phase_timing}
+                  'phase_timing': phase_timing,
+                  'multimodal': dict(getattr(controller, 'multimodal_debug', {}) or {}),
+                  'exec_costs': dict(getattr(controller, 'exec_cost_debug', {}) or {})}
         result_queue.put(result)
         i = time.time() - start_time
     return True

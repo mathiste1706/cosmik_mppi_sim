@@ -166,6 +166,19 @@ class PickPlaceTaskManagerNode(Node):
         )
         self._waypoints_timer = self.create_timer(0.5, self._publish_waypoint_markers)
 
+        # Blocked-goal state (see goal_block_distance).
+        self._block_distance = float(self.get_parameter("goal_block_distance").value)
+        self._block_release = float(self.get_parameter("goal_block_release").value)
+        self._block_clear_sec = float(self.get_parameter("goal_block_clear_sec").value)
+        self._human_caps: list[tuple[np.ndarray, np.ndarray, float]] = []  # (end a, end b, radius) in base frame
+        self._blocked = False
+        self._hold_M: Optional[pin.SE3] = None
+        self._clear_since: Optional[float] = None
+        self._last_tick_now: Optional[float] = None
+        if self._block_distance > 0.0:
+            self.create_subscription(MarkerArray, str(self.get_parameter("human_markers_topic").value),
+                                     self._human_markers_cb, 1)
+
         self._loop_timer = self.create_timer(0.05, self._tick)
         self.get_logger().info(
             f"PickPlace task manager ready. mode={self._params.task_mode.value} "
@@ -359,6 +372,15 @@ class PickPlaceTaskManagerNode(Node):
         self.declare_parameter("wait_for_gripper_result", False)
         self.declare_parameter("gripper_open_wait_sec", 1.0)
         self.declare_parameter("gripper_close_wait_sec", 1.0)
+        # Blocked goal: when a human collision cylinder comes within goal_block_distance of the
+        # current goal position, the robot stops (the goal becomes the pose it has at that moment;
+        # MPPI stays active, so it still avoids the human) and the target timeout is paused. It
+        # resumes once the cylinders are farther than goal_block_distance + goal_block_release for
+        # goal_block_clear_sec. <= 0 disables this behavior.
+        self.declare_parameter("goal_block_distance", 0.0)
+        self.declare_parameter("goal_block_release", 0.02)
+        self.declare_parameter("goal_block_clear_sec", 0.3)
+        self.declare_parameter("human_markers_topic", "/rtcosmik/collision_markers")
 
     def _get_params(self) -> TaskParams:
         def b(name: str) -> bool:
@@ -593,6 +615,16 @@ class PickPlaceTaskManagerNode(Node):
         goal_M = self._compute_phase_goal(self._phase)
         if goal_M is None:
             return
+        # Blocked goal: hold the robot where it is and pause the target deadline.
+        if self._block_distance > 0.0 and self._update_blocked(goal_M):
+            now = self._target_now()
+            if self._target_start_monotonic is not None and self._last_tick_now is not None:
+                self._target_start_monotonic += max(0.0, now - self._last_tick_now)
+            self._last_tick_now = now
+            if self._hold_M is not None:
+                self._publish_goal(self._hold_M)
+            return
+        self._last_tick_now = self._target_now()
         # Start the deadline when a valid goal is available. Gripper phases above
         # finish normally; their elapsed time still counts toward this target.
         if self._target_timed_out():
@@ -948,6 +980,65 @@ class PickPlaceTaskManagerNode(Node):
             self.get_logger().warn(f"TF lookup failed for ee: {exc}")
             return None
         return transform_msg_to_se3(tf.transform)
+
+    def _human_markers_cb(self, msg: MarkerArray) -> None:
+        """Keep the human collision cylinders (current pose) as segments in the base frame."""
+        caps = []
+        transforms: dict[str, Optional[pin.SE3]] = {}
+        for m in msg.markers:
+            if m.type != Marker.CYLINDER or m.action != Marker.ADD:
+                continue
+            frame = m.header.frame_id
+            if frame not in transforms:
+                try:
+                    tf = self._tf_buffer.lookup_transform(self._params.base_frame, frame, Time())
+                    transforms[frame] = transform_msg_to_se3(tf.transform)
+                except TransformException:
+                    transforms[frame] = None
+            base_T = transforms[frame]
+            if base_T is None:
+                continue
+            q = m.pose.orientation
+            R = _quat_to_matrix(q.x, q.y, q.z, q.w)
+            c = np.array([m.pose.position.x, m.pose.position.y, m.pose.position.z])
+            half = 0.5 * m.scale.z * R[:, 2]  # cylinder axis = marker local Z
+            a, b = base_T.act(c - half), base_T.act(c + half)
+            caps.append((np.asarray(a), np.asarray(b), 0.5 * max(m.scale.x, m.scale.y)))
+        self._human_caps = caps
+
+    def _goal_clearance(self, p: np.ndarray) -> float:
+        """Surface distance from point p (base frame) to the nearest human cylinder [m]."""
+        best = float("inf")
+        for a, b, r in self._human_caps:
+            ab = b - a
+            t = float(np.clip(np.dot(p - a, ab) / max(float(np.dot(ab, ab)), 1e-12), 0.0, 1.0))
+            best = min(best, float(np.linalg.norm(p - (a + t * ab))) - r)
+        return best
+
+    def _update_blocked(self, goal_M: pin.SE3) -> bool:
+        """Update and return the blocked state of the current goal (with release hysteresis)."""
+        d = self._goal_clearance(np.asarray(goal_M.translation))
+        now = self._target_now()
+        label = self._target_label(*self._current_target())
+        if not self._blocked:
+            if d < self._block_distance:
+                self._blocked = True
+                self._clear_since = None
+                self._hold_M = self._lookup_ee_in_base()
+                self.get_logger().info(f"[task-event] blocked({label}, clearance={d:.3f}m)")
+            return self._blocked
+        if self._hold_M is None:
+            self._hold_M = self._lookup_ee_in_base()
+        if d > self._block_distance + self._block_release:
+            if self._clear_since is None:
+                self._clear_since = now
+            elif now - self._clear_since >= self._block_clear_sec:
+                self._blocked = False
+                self._hold_M = None
+                self.get_logger().info(f"[task-event] unblocked({label}, clearance={d:.3f}m)")
+        else:
+            self._clear_since = None
+        return self._blocked
 
     def _publish_goal(self, goal_M: pin.SE3) -> None:
         msg = PoseStamped()

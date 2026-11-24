@@ -37,14 +37,22 @@ world_model:
       # cross-section box circumscribing a r=3.5cm cylinder (dims.x=dims.y=2*radius=0.07), same
       # approximation the bridge already applies to RViz CYLINDER markers. Span floor (z=-0.05,
       # matching the table's bottom face) up to robot_base+22cm / +24cm.
-      poto_l:
+      # Poles near targets A and B, removed for the human-arm crossing scenario:
+      # poto_l:
+      #   frame: fer_link0
+      #   dims: [0.10, 0.10, 0.30] # 2*0.035 radius x/y, height = -0.05 (floor) to 0.22 (base+22cm)
+      #   pose: [-0.55, -0.43, 0.075, 0.0, 0.0, 0.0, 1.0]
+      # poto_r:
+      #   frame: fer_link0
+      #   dims: [0.10, 0.10, 0.30] # 2*0.035 radius x/y, height = -0.05 (floor) to 0.24 (base+24cm)
+      #   pose: [-0.55, 0.32, 0.085, 0.0, 0.0, 0.0, 1.0]
+      # Wall behind the robot (side opposite the human), in the plane y=0 from x=0.20 to 1.0 m:
+      # stops the arm from swinging round through x>0 to change sides, so it must cross the
+      # human arm (over or under). Leaves 3.7 cm to the start pose with joint1=-1.57 (fer.urdf.xacro).
+      back_wall:
         frame: fer_link0
-        dims: [0.10, 0.10, 0.30] # 2*0.035 radius x/y, height = -0.05 (floor) to 0.22 (base+22cm)
-        pose: [-0.55, -0.43, 0.075, 0.0, 0.0, 0.0, 1.0]
-      poto_r:
-        frame: fer_link0
-        dims: [0.10, 0.10, 0.30] # 2*0.035 radius x/y, height = -0.05 (floor) to 0.24 (base+24cm)
-        pose: [-0.55, 0.32, 0.085, 0.0, 0.0, 0.0, 1.0]
+        dims: [0.80, 0.04, 1.30] # x, y, z
+        pose: [0.60, 0.0, 0.65, 0.0, 0.0, 0.0, 1.0]
       # base:
       #   frame: fer_link0
       #   dims: [0.15, 0.15, 0.5] # large flat surface in x-y
